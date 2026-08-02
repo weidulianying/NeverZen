@@ -1,0 +1,1171 @@
+// =============================================================================
+// NeverZen Native Build System — single source of truth
+// =============================================================================
+//
+// Applied from build.gradle via:  apply from: 'native/native-build.gradle'
+//
+// This file is the ONLY native build implementation. There is no fallback,
+// no compatibility shim, and no duplicate code in build.gradle.
+//
+// Produces:
+//   build/dist/NeverZenLoader.exe — GUI injector, embeds OpenZen.dll + zen.jar
+//
+// Auto-detects (no PATH dependencies):
+//   - Visual Studio 2019 / 2022 / 2026+  via vswhere.exe
+//   - CMake (bundled with VS, not from PATH)
+//   - MSBuild.exe (VS install, not from PATH)
+//   - rc.exe / cl.exe / link.exe / mt.exe / dumpbin.exe (from VS environment)
+//   - Full MSVC environment via VsDevCmd.bat (INCLUDE, LIB, LIBPATH, SDK, etc.)
+//   - vcpkg (VCPKG_ROOT, common paths, versioned dirs)
+//
+// Gradle compatibility: 8.8+, 9.x
+// OS: Windows 10+, Windows 11
+// VS: 2019 (v16), 2022 (v17), 2026 (v18)
+// =============================================================================
+
+// ---------------------------------------------------------------------------
+// NativeToolchain — pure discovery, zero side effects, thread-safe cache
+// ---------------------------------------------------------------------------
+
+class NativeToolchain {
+
+    private static volatile NativeToolchain INSTANCE
+
+    static NativeToolchain get() {
+        if (INSTANCE == null) {
+            synchronized (NativeToolchain.class) {
+                if (INSTANCE == null) {
+                    INSTANCE = new NativeToolchain()
+                }
+            }
+        }
+        return INSTANCE
+    }
+
+    // ---- cached results ----
+
+    private File _vsWhere
+    private File _visualStudio
+    private String _vsVersion
+    private File _vsDevCmd
+    private File _cmakeExe
+    private File _msBuildExe
+    private File _vcpkgRoot
+    private Map<String, String> _vsEnvironment
+
+    // ---- vswhere.exe ----
+
+    File findVsWhere() {
+        if (_vsWhere != null) return _vsWhere
+
+        def progFilesX86 = System.getenv("ProgramFiles(x86)")
+        if (!progFilesX86) {
+            throw new GradleException(
+                "[NativeBuild] ProgramFiles(x86) environment variable is not set. " +
+                "Are you running on a 64-bit Windows system?")
+        }
+
+        def candidate = new File(progFilesX86,
+            "Microsoft Visual Studio" + File.separator +
+            "Installer" + File.separator +
+            "vswhere.exe")
+
+        if (!candidate.exists()) {
+            throw new GradleException(
+                "[NativeBuild] vswhere.exe not found at:\n" +
+                "  ${candidate.absolutePath}\n\n" +
+                "vswhere.exe is included with the Visual Studio Installer.\n" +
+                "Install any edition of Visual Studio 2019 or later, or repair\n" +
+                "the Visual Studio Installer.\n" +
+                "  https://visualstudio.microsoft.com/downloads/")
+        }
+        _vsWhere = candidate
+        return candidate
+    }
+
+    // ---- Visual Studio installation (try VS2026 → VS2022 → VS2019) ----
+
+    File findVisualStudio() {
+        if (_visualStudio != null) return _visualStudio
+
+        def vswhere = findVsWhere()
+
+        // Preferred order: newest VS first
+        def versionRanges = [
+            "[18.0,19.0)",   // VS2026
+            "[17.0,18.0)",   // VS2022
+            "[16.0,17.0)"    // VS2019
+        ]
+
+        for (range in versionRanges) {
+            def path = queryVsWhere(vswhere, ["-version", range])
+            if (path) {
+                _visualStudio = new File(path)
+                println "[NativeBuild] VS  : ${_visualStudio.absolutePath}"
+                return _visualStudio
+            }
+        }
+
+        // Fallback: any version with the C++ workload
+        def path = queryVsWhere(vswhere, [])
+        if (path) {
+            _visualStudio = new File(path)
+            println "[NativeBuild] VS  : ${_visualStudio.absolutePath} (fallback — version constraint not matched)"
+            return _visualStudio
+        }
+
+        throw new GradleException(
+            "[NativeBuild] No Visual Studio installation with the C++ desktop\n" +
+            "workload was found. Install Visual Studio 2019 or later with the\n" +
+            "'Desktop development with C++' workload selected.\n" +
+            "  https://visualstudio.microsoft.com/downloads/")
+    }
+
+    private String queryVsWhere(File vswhere, List<String> extraArgs) {
+        def args = [
+            vswhere.absolutePath,
+            "-latest",
+            "-products", "*",
+            "-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+            "-property", "installationPath"
+        ]
+        // Insert extra args after the first element (the exe path)
+        if (extraArgs) {
+            args.addAll(1, extraArgs)
+        }
+
+        def proc = args.execute()
+        def stdout = new StringBuilder()
+        def stderr = new StringBuilder()
+        proc.consumeProcessOutput(stdout, stderr)
+        proc.waitFor()
+
+        if (proc.exitValue() != 0) return null
+        def result = stdout.toString().trim()
+        return result.isEmpty() ? null : result
+    }
+
+    // ---- VS product-line version ----
+
+    String findVsVersion() {
+        if (_vsVersion != null) return _vsVersion
+
+        def vswhere = findVsWhere()
+        def proc = [
+            vswhere.absolutePath,
+            "-latest",
+            "-products", "*",
+            "-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+            "-property", "catalog_productLineVersion"
+        ].execute()
+
+        def stdout = new StringBuilder()
+        def stderr = new StringBuilder()
+        proc.consumeProcessOutput(stdout, stderr)
+        proc.waitFor()
+
+        if (proc.exitValue() != 0) {
+            throw new GradleException(
+                "[NativeBuild] vswhere.exe failed to query VS version (exit ${proc.exitValue()}):\n${stderr}")
+        }
+
+        def version = stdout.toString().trim()
+        if (!version) {
+            throw new GradleException(
+                "[NativeBuild] vswhere.exe returned an empty product line version. " +
+                "Your Visual Studio installation may be corrupted.")
+        }
+
+        // Normalise "17.0" → "17"
+        if (version.contains('.')) {
+            version = version.substring(0, version.indexOf('.'))
+        }
+
+        if (!version.isNumber()) {
+            throw new GradleException(
+                "[NativeBuild] Unexpected Visual Studio product line version: '${version}'. " +
+                "Expected a numeric value like 16, 17, or 18.")
+        }
+
+        _vsVersion = version
+        println "[NativeBuild] VS Version: ${_vsVersion}"
+        return version
+    }
+
+    // ---- VsDevCmd.bat ----
+
+    File findVsDevCmd() {
+        if (_vsDevCmd != null) return _vsDevCmd
+
+        def vs = findVisualStudio()
+        def cmd = new File(vs, "Common7" + File.separator + "Tools" + File.separator + "VsDevCmd.bat")
+        if (!cmd.exists()) {
+            throw new GradleException(
+                "[NativeBuild] VsDevCmd.bat not found at:\n" +
+                "  ${cmd.absolutePath}\n\n" +
+                "This file is part of the Visual Studio C++ workload.\n" +
+                "Ensure 'Desktop development with C++' is installed.")
+        }
+        _vsDevCmd = cmd
+        return cmd
+    }
+
+    // ---- CMake (bundled with Visual Studio) ----
+
+    File findCmake() {
+        if (_cmakeExe != null) return _cmakeExe
+
+        def vs = findVisualStudio()
+
+        // VS ships CMake under Common7/IDE/CommonExtensions/Microsoft/CMake/
+        // The exact path varies by VS version; search recursively.
+        def cmakeBase = new File(vs,
+            "Common7" + File.separator +
+            "IDE" + File.separator +
+            "CommonExtensions" + File.separator +
+            "Microsoft" + File.separator +
+            "CMake")
+
+        if (cmakeBase.isDirectory()) {
+            def cmakeExe = new File(cmakeBase, "CMake" + File.separator + "bin" + File.separator + "cmake.exe")
+            if (cmakeExe.exists()) {
+                _cmakeExe = cmakeExe
+                println "[NativeBuild] CMake: ${_cmakeExe.absolutePath}"
+                return _cmakeExe
+            }
+            // Alternative path (older VS versions)
+            cmakeExe = new File(cmakeBase, "bin" + File.separator + "cmake.exe")
+            if (cmakeExe.exists()) {
+                _cmakeExe = cmakeExe
+                println "[NativeBuild] CMake: ${_cmakeExe.absolutePath}"
+                return _cmakeExe
+            }
+        }
+
+        throw new GradleException(
+            "[NativeBuild] CMake not found in the Visual Studio installation.\n" +
+            "Install the 'C++ CMake tools for Windows' component via the\n" +
+            "Visual Studio Installer (Individual components tab).")
+    }
+
+    // ---- MSBuild.exe ----
+
+    File findMsBuild() {
+        if (_msBuildExe != null) return _msBuildExe
+
+        def vs = findVisualStudio()
+        def vswhere = findVsWhere()
+
+        // Strategy 1: vswhere -find
+        def proc = [
+            vswhere.absolutePath,
+            "-latest",
+            "-products", "*",
+            "-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+            "-find", "MSBuild/**/Bin/MSBuild.exe"
+        ].execute()
+
+        def stdout = new StringBuilder()
+        proc.consumeProcessOutput(stdout, new StringBuilder())
+        proc.waitFor()
+
+        if (proc.exitValue() == 0) {
+            def found = stdout.toString().readLines().find { line ->
+                def trimmed = line.trim()
+                trimmed.endsWith("MSBuild.exe") && new File(trimmed).exists()
+            }
+            if (found) {
+                _msBuildExe = new File(found.trim())
+                println "[NativeBuild] MSBuild: ${_msBuildExe.absolutePath}"
+                return _msBuildExe
+            }
+        }
+
+        // Strategy 2: well-known paths inside the VS installation
+        def vsPaths = [
+            new File(vs, "MSBuild" + File.separator + "Current" + File.separator + "Bin" + File.separator + "MSBuild.exe"),
+            new File(vs, "MSBuild" + File.separator + "15.0"   + File.separator + "Bin" + File.separator + "MSBuild.exe")
+        ]
+        for (p in vsPaths) {
+            if (p.exists()) {
+                _msBuildExe = p
+                println "[NativeBuild] MSBuild: ${_msBuildExe.absolutePath}"
+                return _msBuildExe
+            }
+        }
+
+        // Strategy 3: PATH fallback
+        try {
+            def whereProc = ["where", "msbuild.exe"].execute()
+            def whereOut = new StringBuilder()
+            whereProc.consumeProcessOutput(whereOut, new StringBuilder())
+            whereProc.waitForOrKill(3000)
+            if (whereProc.exitValue() == 0) {
+                def line = whereOut.toString().readLines().find { it.trim() }
+                if (line) {
+                    _msBuildExe = new File(line.trim())
+                    println "[NativeBuild] MSBuild: ${_msBuildExe.absolutePath} (from PATH)"
+                    return _msBuildExe
+                }
+            }
+        } catch (Exception ignored) {}
+
+        println "[NativeBuild] MSBuild: not found (CMake uses it internally via the VS generator)"
+        return null
+    }
+
+    // ---- vcpkg ----
+
+    File findVcpkg() {
+        if (_vcpkgRoot != null) return _vcpkgRoot
+
+        def candidates = [] as List<File>
+
+        // 1. VCPKG_ROOT environment variable
+        def envRoot = System.getenv('VCPKG_ROOT')
+        if (envRoot) candidates << new File(envRoot)
+
+        // 2. Common default locations
+        candidates << new File("C:" + File.separator + "vcpkg")
+        candidates << new File("D:" + File.separator + "vcpkg")
+        candidates << new File(System.getProperty('user.home'), "vcpkg")
+
+        // 3. Scan drive roots for versioned installs (e.g. C:/vcpkg-2026.03.18)
+        ["C:" + File.separator, "D:" + File.separator].each { drive ->
+            def root = new File(drive)
+            if (root.isDirectory()) {
+                try {
+                    root.listFiles().each { f ->
+                        if (f.isDirectory() && f.name ==~ /^vcpkg(-.*)?$/) {
+                            candidates << f
+                        }
+                    }
+                } catch (Exception ignored) {
+                    // Permission denied — skip
+                }
+            }
+        }
+
+        for (candidate in candidates) {
+            if (candidate) {
+                def cmakeScript = new File(candidate,
+                    "scripts" + File.separator +
+                    "buildsystems" + File.separator +
+                    "vcpkg.cmake")
+                if (cmakeScript.exists()) {
+                    _vcpkgRoot = candidate
+                    println "[NativeBuild] vcpkg: ${_vcpkgRoot.absolutePath}"
+                    return _vcpkgRoot
+                }
+            }
+        }
+
+        println "[NativeBuild] vcpkg: NOT FOUND"
+        return null
+    }
+
+    static String vcpkgMissingMessage() {
+        return "[NativeBuild] vcpkg not found. The Qt-based loader requires vcpkg for static Qt6.\n" +
+               "One-time setup:\n" +
+               "  git clone https://github.com/microsoft/vcpkg.git C:\\vcpkg\n" +
+               "  C:\\vcpkg\\bootstrap-vcpkg.bat\n" +
+               "Optionally set VCPKG_ROOT or place vcpkg at C:\\vcpkg or D:\\vcpkg.\n" +
+               "Then re-run ./gradlew dll — the first build compiles static Qt\n" +
+               "(30 min – 2 h); subsequent builds are fast."
+    }
+
+    // ---- Git ----
+
+    File findGit() {
+        // 优先使用 GIT_HOME 环境变量
+        def gitHome = System.getenv('GIT_HOME')
+        if (gitHome) {
+            def gitExe = new File(gitHome, "bin\\git.exe")
+            if (gitExe.exists()) {
+                println "[NativeBuild] Git: ${gitExe.absolutePath}"
+                return gitExe
+            }
+            gitExe = new File(gitHome, "cmd\\git.exe")
+            if (gitExe.exists()) {
+                println "[NativeBuild] Git: ${gitExe.absolutePath}"
+                return gitExe
+            }
+        }
+
+        // 在 PATH 中查找 git
+        try {
+            def proc = ["where", "git"].execute()
+            def out = new StringBuilder()
+            proc.consumeProcessOutput(out, new StringBuilder())
+            proc.waitForOrKill(2000)
+            if (proc.exitValue() == 0) {
+                def lines = out.toString().readLines()
+                def found = lines.find { it.trim() }
+                if (found) {
+                    def git = new File(found.trim())
+                    if (git.exists()) {
+                        println "[NativeBuild] Git: ${git.absolutePath}"
+                        return git
+                    }
+                }
+            }
+        } catch (Exception ignored) {}
+
+        println "[NativeBuild] Git: NOT FOUND"
+        return null
+    }
+
+    // ---- Architecture ----
+
+    String resolveArchitecture(Project project) {
+        // 1. Gradle property: -PnativeArch=arm64
+        if (project.hasProperty('nativeArch')) {
+            def val = project.property('nativeArch').toString().trim().toLowerCase()
+            if (val in ['x64', 'amd64', 'arm64']) {
+                return val == 'amd64' ? 'x64' : val
+            }
+            throw new GradleException(
+                "[NativeBuild] Unsupported nativeArch '${val}'. Expected x64, amd64, or arm64.")
+        }
+
+        // 2. Environment variable OPENZEN_NATIVE_ARCH
+        def envArch = System.getenv('OPENZEN_NATIVE_ARCH')
+        if (envArch) {
+            def val = envArch.trim().toLowerCase()
+            if (val in ['x64', 'amd64', 'arm64']) {
+                return val == 'amd64' ? 'x64' : val
+            }
+        }
+
+        // 3. Host architecture
+        def osArch = System.getProperty('os.arch').toLowerCase()
+        if (osArch.contains('aarch')) return 'arm64'
+        return 'x64'
+    }
+
+    // ---- CMake Generator ----
+
+    String selectGenerator(String vsVersion) {
+        int ver = vsVersion.toInteger()
+        if (ver < 16) {
+            throw new GradleException(
+                "[NativeBuild] Visual Studio version ${ver} is too old. " +
+                "NeverZen requires Visual Studio 2019 (v16) or later.")
+        }
+
+        def knownYears = [
+            16: 2019,
+            17: 2022,
+            18: 2026
+        ]
+
+        int year
+        if (knownYears.containsKey(ver)) {
+            year = knownYears[ver]
+        } else {
+            // Extrapolate for forward compatibility: ~3-year release cadence
+            year = 2019 + (ver - 16) * 3
+            println "[NativeBuild] Unknown VS version ${ver} — extrapolating generator year ${year}."
+            println "[NativeBuild] If incorrect, update the knownYears table in native/native-build.gradle."
+        }
+
+        def generator = "Visual Studio ${ver} ${year}"
+        println "[NativeBuild] Generator: ${generator}"
+        return generator
+    }
+
+    // ---- CMake Cache ----
+
+    String readCachedGenerator(File buildDir) {
+        def cacheFile = new File(buildDir, "CMakeCache.txt")
+        if (!cacheFile.exists()) return null
+
+        cacheFile.withReader('UTF-8') { reader ->
+            reader.eachLine { line ->
+                if (line.startsWith("CMAKE_GENERATOR:") || line.startsWith("CMAKE_GENERATOR=")) {
+                    int eq = line.indexOf('=')
+                    if (eq > 0) return line.substring(eq + 1).trim()
+                }
+            }
+        }
+        return null
+    }
+
+    void cleanStaleCache(File buildDir, String expectedGenerator) {
+        def cached = readCachedGenerator(buildDir)
+        if (cached == null) return
+
+        if (cached != expectedGenerator) {
+            println "[NativeBuild] Stale CMake cache: '${cached}' != '${expectedGenerator}'"
+            println "[NativeBuild] Deleting CMakeCache.txt and CMakeFiles/ to avoid generator mismatch..."
+
+            def cacheFile = new File(buildDir, "CMakeCache.txt")
+            if (!cacheFile.delete()) {
+                throw new GradleException(
+                    "[NativeBuild] Failed to delete stale CMakeCache.txt at ${cacheFile}. " +
+                    "Delete it manually and re-run.")
+            }
+
+            def cmakeFilesDir = new File(buildDir, "CMakeFiles")
+            if (cmakeFilesDir.exists()) {
+                cmakeFilesDir.deleteDir()
+            }
+
+            println "[NativeBuild] Stale CMake cache cleaned. CMake will re-configure from scratch."
+        }
+    }
+
+    // ---- VS Environment Capture (VsDevCmd.bat → full environment) ----
+
+    Map<String, String> captureVsEnvironment(String arch) {
+        if (_vsEnvironment != null) return _vsEnvironment
+
+        def vsDevCmd = findVsDevCmd().absolutePath
+        def archFlag = (arch == 'arm64') ? 'arm64' : 'x64'
+
+        println "[NativeBuild] Capturing full MSVC environment from VsDevCmd.bat (arch=${archFlag})..."
+
+        // Run VsDevCmd.bat in cmd.exe and dump the resulting environment with 'set'.
+        // The stdout banner goes to nul; errors pass through to stderr.
+        // We parse every KEY=VALUE line into a Map.
+        def cmd = "call \"${vsDevCmd}\" -arch=${archFlag} -host_arch=${archFlag} >nul && set"
+        def proc = ["cmd", "/c", cmd].execute()
+
+        def stdout = new StringBuilder()
+        def stderr = new StringBuilder()
+        proc.consumeProcessOutput(stdout, stderr)
+        proc.waitFor()
+
+        if (proc.exitValue() != 0) {
+            throw new GradleException(
+                "[NativeBuild] VsDevCmd.bat failed (exit ${proc.exitValue()}):\n${stderr}\n\n" +
+                "Command: ${cmd}")
+        }
+
+        Map<String, String> env = new LinkedHashMap<>()
+        stdout.toString().eachLine { line ->
+            int eq = line.indexOf('=')
+            if (eq > 0) {
+                env[line.substring(0, eq)] = line.substring(eq + 1)
+            }
+        }
+
+        if (env.isEmpty()) {
+            throw new GradleException(
+                "[NativeBuild] VsDevCmd.bat ran successfully but 'set' produced no output. " +
+                "Your Visual Studio installation may be corrupted.")
+        }
+
+        // ===== 强制添加 MSVC 和 SDK 的 bin 目录到 PATH =====
+        def vcToolsDir = env['VCToolsInstallDir']
+        if (vcToolsDir) {
+            def binDir = new File(vcToolsDir, "bin/HostX64/x64")
+            if (binDir.exists()) {
+                env['PATH'] = binDir.absolutePath + File.pathSeparator + (env['PATH'] ?: '')
+                println "[NativeBuild] Added to PATH: ${binDir.absolutePath}"
+            }
+        }
+
+        def sdkDir = env['WindowsSdkDir']
+        def sdkVer = env['WindowsSDKVersion']
+        if (sdkDir && sdkVer) {
+            def sdkBin = new File(sdkDir, "bin/${sdkVer}x64")
+            if (sdkBin.exists()) {
+                env['PATH'] = sdkBin.absolutePath + File.pathSeparator + (env['PATH'] ?: '')
+                println "[NativeBuild] Added to PATH: ${sdkBin.absolutePath}"
+            }
+        }
+
+        // ===== 添加 Git 到 PATH（如果找到） =====
+        def gitExe = findGit()
+        if (gitExe) {
+            def gitBin = gitExe.parentFile
+            if (gitBin.exists()) {
+                env['PATH'] = gitBin.absolutePath + File.pathSeparator + (env['PATH'] ?: '')
+                println "[NativeBuild] Added Git to PATH: ${gitBin.absolutePath}"
+                env['GIT'] = gitExe.absolutePath   // vcpkg 会优先使用此变量
+            }
+        }
+
+        // Log all key MSVC/SDK variables for diagnostics
+        def keyVars = [
+            'VisualStudioVersion',
+            'VCToolsVersion',
+            'VCToolsInstallDir',
+            'VCINSTALLDIR',
+            'WindowsSDKVersion',
+            'WindowsSdkDir',
+            'UniversalCRTSdkDir',
+            'WindowsLibPath',
+            'Platform',
+            'FrameworkDir',
+            'FrameworkVersion',
+            'ExtensionSdkDir',
+            'UCRTVersion'
+        ]
+        println "[NativeBuild] --- MSVC Environment ---"
+        for (kv in keyVars) {
+            def val = env[kv] ?: '(not set)'
+            println "[NativeBuild]   ${kv}=${val}"
+        }
+
+        // Resolve and log toolchain executables from the captured PATH
+        def tools = [
+            'cl.exe',
+            'link.exe',
+            'rc.exe',
+            'mt.exe',
+            'dumpbin.exe',
+            'lib.exe',
+            'ml64.exe'
+        ]
+        println "[NativeBuild] --- Toolchain Executables ---"
+        def envPath = env['PATH'] ?: ''
+        def pathDirs = envPath.split(';')
+        def exts = (System.getenv('PATHEXT') ?: '.EXE;.BAT;.CMD').split(';')
+
+        for (tool in tools) {
+            def resolved = resolveInPath(tool, pathDirs, exts)
+            if (resolved) {
+                println "[NativeBuild]   ${tool}: ${resolved}"
+            } else {
+                println "[NativeBuild]   ${tool}: NOT FOUND in VS environment PATH"
+            }
+        }
+
+        println "[NativeBuild] --- End Environment ---"
+
+        // ===== 设置 CC/CXX =====
+        def clPath = resolveInPath('cl.exe', pathDirs, exts)
+        if (clPath) {
+            env['CC'] = clPath
+            env['CXX'] = clPath
+            println "[NativeBuild] Set CC/CXX = ${clPath}"
+        } else {
+            println "[NativeBuild] WARNING: cl.exe not found in PATH, CC/CXX not set"
+        }
+
+        // ===== 强制禁用 vcpkg 编译器检测和 Ninja =====
+        env['VCPKG_DETECT_COMPILER'] = '0'
+        env['VCPKG_USE_NINJA'] = '0'
+
+        // 强制设置平台相关变量，帮助 Ninja 检测
+        env['Platform'] = 'x64'
+        env['VSCMD_ARG_TGT_ARCH'] = 'x64'
+        env['VSCMD_ARG_HOST_ARCH'] = 'x64'
+        // 确保 INCLUDE 和 LIB 已在环境中（VsDevCmd 应该已设置）
+
+        _vsEnvironment = env
+        return env
+    }
+
+    private static String resolveInPath(String toolName, String[] pathDirs, String[] exts) {
+        for (dir in pathDirs) {
+            if (!dir) continue
+            for (ext in exts) {
+                if (!ext) continue
+                def f = new File(dir, toolName.endsWith(ext) ? toolName : toolName + ext)
+                if (f.exists()) return f.absolutePath
+            }
+            // Also try without extension
+            def f = new File(dir, toolName)
+            if (f.exists()) return f.absolutePath
+        }
+        return null
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Path constants (absolute, derived from project layout)
+// ---------------------------------------------------------------------------
+
+def nativeDir         = project.file('native')
+def nativeBuildDir    = new File(nativeDir, 'build')
+def nativeOutDir      = new File(nativeDir, 'out')
+def nativeBinDir      = new File(nativeDir, 'bin')
+def zenJarStaged      = new File(nativeDir, 'zen.jar')
+def distDir           = new File(project.buildDir, 'dist')
+
+// Provider-based references for task inputs/outputs
+def nativeBuildDirProvider  = project.layout.projectDirectory.dir('native/build')
+
+// ---------------------------------------------------------------------------
+// Helper functions
+// ---------------------------------------------------------------------------
+
+/**
+ * Return the short (7-char) git revision of HEAD.
+ * Respects OPENZEN_BUILD_REVISION (set by CI) so git is not required on PATH.
+ * Returns null if unavailable.
+ */
+def gitShortRevision() {
+    def envRev = System.getenv('OPENZEN_BUILD_REVISION')
+    if (envRev && !envRev.allWhitespace) return envRev.trim().take(7)
+
+    try {
+        def proc = ['git', 'rev-parse', '--short=7', 'HEAD'].execute(
+            null, project.rootDir)
+        def stdout = new StringBuilder()
+        proc.consumeProcessOutput(stdout, new StringBuilder())
+        proc.waitForOrKill(2000)
+        if (proc.exitValue() == 0) {
+            def v = stdout.toString().trim()
+            if (v) return v
+        }
+    } catch (Exception ignored) {}
+    return null
+}
+
+/**
+ * Locate upx.exe on PATH. Returns absolute path or null.
+ */
+def findUpx() {
+    try {
+        def proc = ['where', 'upx.exe'].execute()
+        def stdout = new StringBuilder()
+        proc.consumeProcessOutput(stdout, new StringBuilder())
+        proc.waitForOrKill(3000)
+        if (proc.exitValue() == 0) {
+            def first = stdout.toString().readLines().find { it?.trim() }
+            if (first) {
+                def upxPath = first.trim()
+                println "[NativeBuild] UPX: ${upxPath}"
+                return upxPath
+            }
+        }
+    } catch (Exception ignored) {}
+    println "[NativeBuild] UPX: not found on PATH (optional)"
+    return null
+}
+
+// ---------------------------------------------------------------------------
+// Task: stageNativeJar
+// ---------------------------------------------------------------------------
+// Copies the obfuscated + reobfuscated mod jar to native/zen.jar so the CMake
+// DLL build can embed it as an RCDATA resource (via openzen.rc).
+//
+// Uses proper task inputs/outputs for up-to-date checking — no
+// outputs.upToDateWhen { false } workaround.  Compatible with Gradle 8.8+ / 9.x.
+
+tasks.register('stageNativeJar') {
+    group = 'openzen'
+    description = 'Stage the obfuscated mod jar to native/zen.jar for DLL embedding.'
+
+    dependsOn 'obfuscateClasses'
+
+    // 输入：jar 任务的最终输出（已被 obfuscateClasses 修改）
+    inputs.file(tasks.jar.archiveFile)
+    // 输出：native/zen.jar
+    outputs.file(project.file('native/zen.jar'))
+
+    doLast {
+        // 在 doLast 中安全地获取 Provider 的值
+        def src = tasks.jar.archiveFile.get().asFile
+        def dst = project.file('native/zen.jar')
+
+        if (!src.exists()) {
+            throw new GradleException(
+                "[NativeBuild] stageNativeJar: source jar not found at ${src.absolutePath}")
+        }
+
+        // 删除旧文件，避免文件锁定问题
+        if (dst.exists() && !dst.delete()) {
+            throw new GradleException(
+                "[NativeBuild] stageNativeJar: cannot delete existing ${dst.absolutePath}")
+        }
+
+        dst.parentFile.mkdirs()
+        project.copy {
+            from src
+            into dst.parentFile
+            rename { dst.name }
+        }
+
+        println "[NativeBuild] Staged jar: ${src.name} (${src.length()} bytes) → ${dst.absolutePath}"
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Task: configureNative
+// ---------------------------------------------------------------------------
+// Runs CMake configure on the native sub-projects (DLL + Loader) inside the
+// 'native/' source tree.  All paths are absolute.  The MSVC environment is
+// fully captured from VsDevCmd.bat and injected so CMake, vcpkg, and the
+// Visual Studio generator all see consistent compiler/SDK paths.
+//
+// No workingDir — every path on the command line is absolute.
+// No cmd /c — uses Exec's native commandLine(List).
+
+tasks.register('configureNative', Exec) {
+    group = 'openzen'
+    description = 'Run CMake configure on the native sub-projects (DLL + Loader).'
+
+    dependsOn 'stageNativeJar'
+
+    // Limit vcpkg parallelism on local dev machines; CI keeps full parallelism.
+    if (System.getenv('GITHUB_ACTIONS') == null) {
+        environment 'VCPKG_MAX_CONCURRENCY', '1'
+    }
+
+    doFirst {
+        def tc = NativeToolchain.get()
+
+        // --- Resolve all paths & tools ---
+        def cmake   = tc.findCmake().absolutePath
+        def vcpkg   = tc.findVcpkg()
+        if (!vcpkg) {
+            throw new GradleException(NativeToolchain.vcpkgMissingMessage())
+        }
+        def vcpkgToolchain = vcpkg.absolutePath +
+            File.separator + 'scripts' +
+            File.separator + 'buildsystems' +
+            File.separator + 'vcpkg.cmake'
+
+        def arch      = tc.resolveArchitecture(project)
+        def rev       = gitShortRevision()
+        def srcDir    = nativeDir.absolutePath
+        def buildDir  = nativeBuildDir.absolutePath
+
+        // ---- 检测 Ninja（使用 vcpkg 下载的版本） ----
+        def ninjaPath = null
+        if (vcpkg) {
+            def ninjaCandidates = [
+                new File(vcpkg, "downloads/tools/ninja-1.13.2-windows/ninja.exe"),
+                new File(vcpkg, "downloads/tools/ninja-1.12.1-windows/ninja.exe"),
+                new File(vcpkg, "downloads/tools/ninja-1.11.1-windows/ninja.exe")
+            ]
+            for (cand in ninjaCandidates) {
+                if (cand.exists()) {
+                    ninjaPath = cand.absolutePath
+                    println "[NativeBuild] Ninja found: ${ninjaPath}"
+                    break
+                }
+            }
+        }
+        if (!ninjaPath) {
+            // 尝试从 PATH 中查找 ninja
+            try {
+                def proc = ['where', 'ninja'].execute()
+                def out = new StringBuilder()
+                proc.consumeProcessOutput(out, new StringBuilder())
+                proc.waitForOrKill(2000)
+                if (proc.exitValue() == 0) {
+                    def line = out.toString().readLines().find { it.trim() }
+                    if (line) {
+                        ninjaPath = line.trim()
+                        println "[NativeBuild] Ninja found in PATH: ${ninjaPath}"
+                    }
+                }
+            } catch (Exception ignored) {}
+        }
+        if (!ninjaPath) {
+            throw new GradleException(
+                "[NativeBuild] Ninja not found. Please install Ninja or ensure vcpkg has downloaded it.\n" +
+                "vcpkg usually places it under downloads/tools/ninja-*/ninja.exe")
+        }
+
+        // ---- 使用 Ninja 生成器 ----
+        def generator = "Ninja"
+        def platform = arch  // x64 or arm64
+
+        // --- Capture full MSVC environment ---
+        def vsEnv = tc.captureVsEnvironment(arch)
+        vsEnv.each { k, v -> environment k, v }
+
+        // ---- 重建干净的 PATH，避免非 ASCII 字符 ----
+        def safePath = [] as List<String>
+
+        // 1. MSVC bin 目录
+        def vcToolsDir = vsEnv['VCToolsInstallDir']
+        if (vcToolsDir) {
+            def binDir = new File(vcToolsDir, "bin/HostX64/x64")
+            if (binDir.exists()) safePath << binDir.absolutePath
+        }
+
+        // 2. Windows SDK bin 目录
+        def sdkDir = vsEnv['WindowsSdkDir']
+        def sdkVer = vsEnv['WindowsSDKVersion']
+        if (sdkDir && sdkVer) {
+            def sdkBin = new File(sdkDir, "bin/${sdkVer}x64")
+            if (sdkBin.exists()) safePath << sdkBin.absolutePath
+        }
+
+        // 3. Git bin 目录
+        def gitExe = tc.findGit()
+        if (gitExe) {
+            def gitBin = gitExe.parentFile
+            if (gitBin.exists()) safePath << gitBin.absolutePath
+        }
+
+        // 4. 系统必需目录（保证基本命令可用）
+        safePath << 'C:\\Windows\\System32'
+        safePath << 'C:\\Windows'
+        safePath << 'C:\\Windows\\System32\\Wbem'
+        safePath << 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0'
+        safePath << 'C:\\Windows\\Microsoft.NET\\Framework64\\v4.0.30319'
+
+        // 5. 可选：MSBuild 路径（确保 MSBuild 可被找到）
+        def msbuildPath = tc.findMsBuild()?.parentFile?.absolutePath
+        if (msbuildPath) safePath << msbuildPath
+
+        // 覆盖 PATH
+        environment 'PATH', safePath.join(';')
+        println "[NativeBuild] Rebuilt PATH (clean): ${safePath.join(';')}"
+
+        // 从 vsEnv 中获取 cl.exe 路径（已在 captureVsEnvironment 中设置了 CC）
+        def clPath = vsEnv['CC']
+        if (!clPath) {
+            throw new GradleException(
+                "[NativeBuild] CC environment variable not set. cl.exe not found.")
+        }
+        // 将反斜杠替换为正斜杠，避免 CMake 转义问题
+        def clPathNormalized = clPath.replace('\\', '/')
+
+        // --- Clean stale CMake cache from a different generator ---
+        tc.cleanStaleCache(nativeBuildDir, generator)
+
+        // --- Diagnostic summary ---
+        println "[NativeBuild] ========================================"
+        println "[NativeBuild] CMake Configure"
+        println "[NativeBuild] ========================================"
+        println "[NativeBuild] CMake       : ${cmake}"
+        println "[NativeBuild] Generator   : ${generator}"
+        println "[NativeBuild] Arch        : ${arch}"
+        println "[NativeBuild] Source Dir  : ${srcDir}"
+        println "[NativeBuild] Build Dir   : ${buildDir}"
+        println "[NativeBuild] vcpkg Root  : ${vcpkg.absolutePath}"
+        println "[NativeBuild] vcpkg Triplet: x64-windows-static"
+        println "[NativeBuild] Build Rev   : ${rev ?: '(unknown)'}"
+        println "[NativeBuild] ========================================"
+
+        // --- Build command-line (all absolute paths, no cmd /c) ---
+        // Use string concatenation (+) instead of GString (${}) for Gradle 9 safety.
+        def cmakeArgs = [
+            cmake,
+            "-G", generator,
+            "-S", srcDir,
+            "-B", buildDir,
+            "-DCMAKE_MAKE_PROGRAM=" + ninjaPath,
+            "-DCMAKE_TOOLCHAIN_FILE=" + vcpkgToolchain,
+            "-DVCPKG_TARGET_TRIPLET=x64-windows-static",
+            "-DVCPKG_HOST_TRIPLET=x64-windows-static",
+            "-DCMAKE_C_COMPILER=${clPathNormalized}",
+            "-DCMAKE_CXX_COMPILER=${clPathNormalized}"
+        ]
+
+        if (rev) {
+            cmakeArgs << "-DOPENZEN_BUILD_REVISION=" + rev
+        }
+
+        commandLine cmakeArgs
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Task: buildNative
+// ---------------------------------------------------------------------------
+// Compiles OpenZen.dll and NeverZenLoader.exe using CMake --build (which
+// invokes MSBuild under the hood with the Visual Studio generator).
+//
+// Local dev → serial build (--parallel 1, avoids Qt parallel-build flakes).
+// CI        → all processors (--parallel, no job limit).
+
+tasks.register('buildNative', Exec) {
+    group = 'openzen'
+    description = 'Compile OpenZen.dll and NeverZenLoader.exe (CMake --build).'
+
+    dependsOn 'configureNative'
+
+    doFirst {
+        def tc = NativeToolchain.get()
+        def cmake    = tc.findCmake().absolutePath
+        def buildDir = nativeBuildDir.absolutePath
+        def arch     = tc.resolveArchitecture(project)
+
+        // Re-capture VS environment so buildNative can run standalone
+        // (without configureNative in the same Gradle invocation).
+        def vsEnv = tc.captureVsEnvironment(arch)
+        vsEnv.each { k, v -> environment k, v }
+
+        def isCI = System.getenv('GITHUB_ACTIONS') != null
+        def buildType = 'Release'
+
+        println "[NativeBuild] ========================================"
+        println "[NativeBuild] CMake Build"
+        println "[NativeBuild] ========================================"
+        println "[NativeBuild] Build Dir   : ${buildDir}"
+        println "[NativeBuild] Config      : ${buildType}"
+        println "[NativeBuild] Mode        : ${isCI ? 'CI (all processors)' : 'local (serial)'}"
+        println "[NativeBuild] ========================================"
+
+        // Build command-line (all absolute paths)
+        def buildArgs = [
+            cmake,
+            "--build", buildDir,
+            "--config", buildType
+        ]
+
+        if (isCI) {
+            // CI: use all available processors
+            buildArgs << "--parallel"
+        } else {
+            // Local: serial build to avoid Qt MOC/UIC parallel-compilation flakes
+            buildArgs << "--parallel" << "1"
+        }
+
+        commandLine buildArgs
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Task: packageDist
+// ---------------------------------------------------------------------------
+// Collects NeverZenLoader.exe into build/dist/.
+// OpenZen.dll is embedded inside the EXE as an RCDATA resource, so users
+// only need to distribute a single file.
+
+tasks.register('packageDist') {
+    group = 'openzen'
+    description = 'Collect the Loader EXE into build/dist for distribution.'
+
+    dependsOn 'buildNative'
+
+    // Lazy input: the loader EXE may not exist at configuration time.
+    inputs.property('buildDir', nativeBuildDir.absolutePath)
+
+    def loaderExe = project.layout.buildDirectory.file(
+        'dist/NeverZenLoader.exe')
+
+    outputs.file(loaderExe)
+
+    doLast {
+        def src = new File(nativeBuildDir,
+            'loader' + File.separator +
+            'NeverZenLoader.exe')
+
+        if (!src.isFile()) {
+            throw new GradleException(
+                "[NativeBuild] packageDist: NeverZenLoader.exe not found at:\n" +
+                "  ${src.absolutePath}\n\n" +
+                "The CMake build may have failed. Check the build log above for errors.")
+        }
+
+        def dstDir = distDir
+        dstDir.mkdirs()
+
+        project.copy {
+            from src
+            into dstDir
+        }
+
+        def dst = new File(dstDir, src.name)
+        println "[NativeBuild] Packaged: ${String.format('%,d', src.length())} bytes → ${dst.absolutePath}"
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Task: upxCompress
+// ---------------------------------------------------------------------------
+// Optional: runs UPX --best --lzma on the packaged NeverZenLoader.exe.
+// No-op (warning only) when upx is not on PATH.
+
+tasks.register('upxCompress') {
+    group = 'openzen'
+    description = 'Run UPX --best --lzma on the packaged EXE (no-op without upx).'
+
+    dependsOn 'packageDist'
+
+    doLast {
+        def exe = new File(distDir, 'NeverZenLoader.exe')
+        if (!exe.isFile()) {
+            throw new GradleException(
+                "[NativeBuild] upxCompress: EXE not found at ${exe.absolutePath}")
+        }
+
+        def upx = findUpx()
+        if (!upx) {
+            project.logger.warn(
+                "[NativeBuild] UPX not found on PATH — skipping compression.\n" +
+                "Install from https://upx.github.io/ to enable.")
+            return
+        }
+
+        def before = exe.length()
+        project.exec {
+            commandLine upx, '--best', '--lzma', exe.absolutePath
+        }
+        def after = exe.length()
+
+        println "[NativeBuild] UPX: " +
+            String.format("%,d", before) + " → " +
+            String.format("%,d", after) + " bytes (" +
+            String.format("%.1f", after * 100.0d / before) + "% of original)"
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Task: dll (umbrella)
+// ---------------------------------------------------------------------------
+// Top-level entry point for the full native build pipeline:
+//
+//   obfuscateClasses → stageNativeJar → configureNative → buildNative → packageDist → upxCompress
+//
+// Run:  ./gradlew dll
+// The output is build/dist/NeverZenLoader.exe
+
+tasks.register('dll') {
+    group = 'openzen'
+    description = 'Build the native DLL + GUI Loader (→ build/dist/NeverZenLoader.exe).'
+    dependsOn 'upxCompress'
+}
+
+// ---------------------------------------------------------------------------
+// Task: cleanNative
+// ---------------------------------------------------------------------------
+// Removes ALL native build artifacts so the repository returns to a pristine
+// state.  Wired into the root 'clean' task.
+
+tasks.register('cleanNative', Delete) {
+    group = 'openzen'
+    description = 'Remove native/build/, native/out/, native/bin/, native/zen.jar, and build/dist/.'
+
+    delete nativeBuildDir
+    delete nativeOutDir
+    delete nativeBinDir
+    delete zenJarStaged
+    delete distDir
+}
+
+// Wire cleanNative into the root project's clean lifecycle.
+// Use tasks.named (lazy) — no afterEvaluate needed for Gradle 9 compatibility.
+tasks.named('clean').configure {
+    dependsOn 'cleanNative'
+}
+
+// ---------------------------------------------------------------------------
+// Configuration-time diagnostics
+// ---------------------------------------------------------------------------
+// These run even on a dry-run (./gradlew tasks) so the developer can verify
+// their environment without waiting for a full build.
+
+println "[NativeBuild] ========================================"
+println "[NativeBuild] NeverZen Native Build System"
+println "[NativeBuild] ========================================"
+println "[NativeBuild] Project    : ${project.rootDir.absolutePath}"
+println "[NativeBuild] Build Dir  : ${project.buildDir.absolutePath}"
+println "[NativeBuild] Native Dir : ${nativeDir.absolutePath}"
+
+// These may throw if VS is not installed — that's intentional, it surfaces
+// the problem at configuration time rather than deep in a build.
+try {
+    println "[NativeBuild] VS         : ${NativeToolchain.get().findVisualStudio().absolutePath}"
+    println "[NativeBuild] CMake      : ${NativeToolchain.get().findCmake().absolutePath}"
+    println "[NativeBuild] MSBuild    : ${NativeToolchain.get().findMsBuild()?.absolutePath ?: 'not found (optional)'}"
+    println "[NativeBuild] vcpkg      : ${NativeToolchain.get().findVcpkg()?.absolutePath ?: 'NOT FOUND (install for dll builds)'}"
+    println "[NativeBuild] Arch       : ${NativeToolchain.get().resolveArchitecture(project)}"
+} catch (GradleException e) {
+    println "[NativeBuild] WARNING: ${e.message}"
+    println "[NativeBuild] Native tasks (dll, configureNative, buildNative) will fail."
+    println "[NativeBuild] Java-only tasks (jar, build, runClient) are unaffected."
+}
+println "[NativeBuild] ========================================"
