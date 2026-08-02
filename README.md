@@ -32,7 +32,7 @@ NeverZen 支持两种交付形式：**Java Agent jar**（挂到 Minecraft JVM �
 - **JDK 17**（推荐 Microsoft Build of OpenJDK / Temurin / Azul Zulu 任一）。
 - 必须设置 `JAVA_HOME` 环境变量指向该 JDK 安装目录（PowerShell 验证：`echo $env:JAVA_HOME`）。
 - 仓库根目录用 `gradlew.bat` 即可，**不需要**单独安装 Gradle。
-- **可选：UPX** —— 仅热注入器路径会用到，作用是把最终的 `OpenZenLoader.exe` 从 ~32 MB 压到 ~10 MB。在 `PATH` 上检测到 `upx` 时 `./gradlew upxCompress` 会自动跑 `--best --lzma`；找不到就只打一条 warning 直接跳过，不影响功能。安装方式：
+- **可选：UPX** —— 仅热注入器路径会用到，作用是把最终的 `NeverLoader.exe` 从 ~32 MB 压到 ~10 MB。在 `PATH` 上检测到 `upx` 时 `./gradlew upxCompress` 会自动跑 `--best --lzma`；找不到就只打一条 warning 直接跳过，不影响功能。安装方式：
 
     ```powershell
     choco install upx -y
@@ -64,7 +64,7 @@ NeverZen 支持两种交付形式：**Java Agent jar**（挂到 Minecraft JVM �
 
 #### 额外前置 — 必须项
 
-1. **Visual Studio**（Community 版即可，免费）。安装时勾选：
+1. **Visual Studio**（Community 版即可，免费）（理论上支持22到26版的VisualStudio,安装路径不能有**中文**!!!!!!!!）。安装时勾选：
     - **"使用 C++ 的桌面开发"** 工作负载
     - 该工作负载的可选组件里勾上 **"适用于 Windows 的 C++ CMake 工具"**（"C++ CMake tools for Windows"）
 2. **`JAVA_HOME` 必须指向 JDK 17**（不只是 JRE）。CMake 需要它定位 `<JAVA_HOME>/include/jni.h` 和 `<JAVA_HOME>/include/win32/jvmti.h`。
@@ -80,7 +80,7 @@ NeverZen 支持两种交付形式：**Java Agent jar**（挂到 Minecraft JVM �
     ```
 
     Gradle 检测顺序：环境变量 `VCPKG_ROOT` → `C:\vcpkg` → `D:\vcpkg` → `%USERPROFILE%\vcpkg`。
-    **首次** `./gradlew dll` 时 vcpkg 会按 `native/vcpkg.json` 编译静态 Qt6（30 分钟到 2 小时，看 CPU），之后增量 build 几分钟。Qt 完全静态链接进 EXE，所以分发依然单文件——`OpenZenLoader.exe` 自带 Qt6 + OpenZen.dll，零运行时依赖。
+    **首次** `./gradlew dll` 时 vcpkg 会按 `native/vcpkg.json` 编译静态 Qt6（30 分钟到 2 小时，看 CPU），之后增量 build 几分钟。Qt 完全静态链接进 EXE，所以分发依然单文件——`NeverZenLoader.exe` 自带 Qt6 + OpenZen.dll，零运行时依赖。
 
 #### 构建命令
 
