@@ -88,7 +88,7 @@ NeverZen 支持两种交付形式：**Java Agent jar**（挂到 Minecraft JVM �
 .\gradlew.bat dll
 ```
 
-产物：`build/dist/NeverZenLoader.exe`。如果已装 UPX 想顺便压缩，跑 `.\gradlew.bat upxCompress`。
+产物：`build/dist/NeverZenLoader.exe`。如果已装 UPX 想顺便压缩，跑 `.\gradlew.bat upxCompress`。（.\gradlew.bat dll会自动识别UPX，可以不用这条命令）
 
 #### 使用注入器
 
