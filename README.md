@@ -2,8 +2,9 @@
 NeverZen 增加了**Neverlose**风格的ClickGUI。删除OpenZen的**LieDetector**功能
 
 添加了若干**视觉**，如**KillLog**，**KillEffect**...
-<img width="2560" height="1600" alt="Neverlose" src="https://github.com/user-attachments/assets/525ad872-0337-498b-b626-0b15891b8e74" />
-<img width="2560" height="1600" alt="image" src="https://github.com/user-attachments/assets/383d5034-eb34-4a3f-be68-0a4b42358ac3" />
+<img width="2560" height="1600" alt="630286616-525ad872-0337-498b-b626-0b15891b8e74" src="https://github.com/user-attachments/assets/85660ca9-1119-4415-b2e2-d51d90a3834d" />
+<img width="2560" height="1600" alt="630287180-383d5034-eb34-4a3f-be68-0a4b42358ac3" src="https://github.com/user-attachments/assets/ad294590-fdaa-4a6d-a65d-aa3362bc31e7" />
+
 
 
 ## 构建
