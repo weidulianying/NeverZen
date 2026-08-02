@@ -1,5 +1,5 @@
 ## 改动
-NeverZen 增加了**Neverlose**风格的ClickGUI。删除OpenZen的**LieDetector**功能
+NeverZen 增加了**Neverlose**风格的ClickGUI。删除OpenZen的**LieDetector**功能，支持第三方服务器强制改皮肤（基于[万用皮肤补丁] CustomSkinLoader编写的代码）支持LittleSkin登录。
 
 添加了若干**视觉**，如**KillLog**，**KillEffect**...
 <img width="2560" height="1600" alt="630286616-525ad872-0337-498b-b626-0b15891b8e74" src="https://github.com/user-attachments/assets/85660ca9-1119-4415-b2e2-d51d90a3834d" />
