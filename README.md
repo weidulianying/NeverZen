@@ -9,7 +9,7 @@ NeverZen 增加了**Neverlose**风格的ClickGUI。删除OpenZen的**LieDetector
 
 ## 构建
 
-NeverZen 支持两种交付形式：**Java Agent jar**（挂到 Minecraft JVM 启动参数里）（目前发现原OpenZen进入游戏无效，所以NeverZen不做构建建议）和 **热注入器 (单文件 EXE，内嵌 DLL)**。Agent 路径只要 JDK，注入器路径还需要 MSVC 工具链。
+NeverZen 支持两种交付形式：**Java Agent jar**（挂到 Minecraft JVM 启动参数里）（目前发现原OpenZen使用PCL进入游戏无效，所以NeverZen不做构建建议）和 **热注入器 (单文件 EXE，内嵌 DLL)**。Agent 路径只要 JDK，注入器路径还需要 MSVC 工具链。
 
 > **本项目不能作为 Forge mod 启动。** `mods/` 加载路径不被支持，不要把 jar 丢进 `.minecraft/mods/`。
 
